@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 
 from telegram import Update
 
 from .config import AppConfig
-from .services import VacancyBotService
 from .telegram_app import build_application
 
 
@@ -22,8 +20,7 @@ def main() -> int:
     configure_logging(config.log_level)
     config.state_path.parent.mkdir(parents=True, exist_ok=True)
 
-    service = asyncio.run(VacancyBotService.build(config=config))
-    application = build_application(config.telegram_bot_token, service)
+    application = build_application(config)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
     return 0
 

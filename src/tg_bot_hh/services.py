@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 
@@ -57,14 +58,15 @@ class VacancyBotService:
         config: AppConfig,
         client: HHClient,
         state_store: StateStore,
-        area_id: str,
-        remote_schedule_id: str,
+        area_id: str | None = None,
+        remote_schedule_id: str | None = None,
     ) -> None:
         self.config = config
         self.client = client
         self.state_store = state_store
         self.area_id = area_id
         self.remote_schedule_id = remote_schedule_id
+        self._lookup_init_lock: asyncio.Lock | None = None
 
     @classmethod
     async def build(
@@ -80,14 +82,10 @@ class VacancyBotService:
             timeout_seconds=config.http_timeout_seconds,
         )
         store = state_store or StateStore(config.state_path)
-        area_id = await hh_client.resolve_area_id(config.target_area_name)
-        remote_schedule_id = await hh_client.resolve_remote_schedule_id()
         return cls(
             config=config,
             client=hh_client,
             state_store=store,
-            area_id=area_id,
-            remote_schedule_id=remote_schedule_id,
         )
 
     async def handle_start(self, chat_id: int) -> StartCommandResult:
@@ -102,6 +100,8 @@ class VacancyBotService:
             )
 
         state = state.with_chat_id(chat_id).with_polling_enabled(True)
+        self.state_store.save(state)
+
         vacancies, _ = await self._collect_matching_vacancies(
             state=state,
             budget=RequestBudget(self.config.hh_request_limit_per_cycle),
@@ -163,6 +163,7 @@ class VacancyBotService:
         budget: RequestBudget,
         update_floors: bool,
     ) -> tuple[tuple[VacancySummary, ...], BotState]:
+        await self._ensure_search_filters()
         details_cache: dict[str, VacancyDetails] = {}
 
         local_result = await self._fetch_branch(
@@ -196,6 +197,21 @@ class VacancyBotService:
 
         return merged, state
 
+    async def _ensure_search_filters(self) -> None:
+        if self.area_id is not None and self.remote_schedule_id is not None:
+            return
+
+        if self._lookup_init_lock is None:
+            self._lookup_init_lock = asyncio.Lock()
+
+        async with self._lookup_init_lock:
+            if self.area_id is None:
+                self.area_id = await self.client.resolve_area_id(
+                    self.config.target_area_name
+                )
+            if self.remote_schedule_id is None:
+                self.remote_schedule_id = await self.client.resolve_remote_schedule_id()
+
     async def _fetch_branch(
         self,
         *,
@@ -215,8 +231,16 @@ class VacancyBotService:
             if branch == "local"
             else state.pagination_floor_remote
         )
-        area_id = self.area_id if branch == "local" else None
-        schedule_id = self.remote_schedule_id if branch == "remote" else None
+        if branch == "local":
+            if self.area_id is None:
+                raise RuntimeError("local area id is not initialized")
+            area_id = self.area_id
+            schedule_id = None
+        else:
+            if self.remote_schedule_id is None:
+                raise RuntimeError("remote schedule id is not initialized")
+            area_id = None
+            schedule_id = self.remote_schedule_id
 
         while (
             budget.available

@@ -23,6 +23,10 @@ class HHClientError(RuntimeError):
     """Base hh client error."""
 
 
+class HHUnavailableError(HHClientError):
+    """Raised when hh.ru is temporarily unavailable."""
+
+
 class AreaResolutionError(HHClientError):
     """Raised when a city cannot be resolved to a single leaf area."""
 
@@ -147,7 +151,13 @@ class HHClient:
     ) -> Any:
         attempt = 0
         while True:
-            response = await self._client.request(method, path, params=params)
+            try:
+                response = await self._client.request(method, path, params=params)
+            except httpx.HTTPError as exc:
+                raise HHUnavailableError(
+                    f"Failed to reach hh.ru for {method} {path}"
+                ) from exc
+
             if response.status_code == 429 and attempt < self._max_retries:
                 delay = 2**attempt
                 LOGGER.warning(
@@ -160,8 +170,23 @@ class HHClient:
                 attempt += 1
                 continue
 
-            response.raise_for_status()
-            return response.json()
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                status_code = exc.response.status_code
+                if status_code == 429 or status_code == 408 or status_code >= 500:
+                    raise HHUnavailableError(
+                        f"hh.ru is unavailable for {method} {path}; status={status_code}"
+                    ) from exc
+                raise HHClientError(
+                    f"hh.ru returned non-retryable status={status_code} "
+                    f"for {method} {path}"
+                ) from exc
+
+            try:
+                return response.json()
+            except ValueError as exc:
+                raise HHClientError(f"Invalid JSON in response for {method} {path}") from exc
 
     @staticmethod
     def _parse_vacancy_summary(item: dict[str, Any]) -> VacancySummary:
