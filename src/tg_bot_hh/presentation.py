@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime
-
 from .models import Salary, VacancySummary
 
 DEFAULT_BATCH_SIZE = 10
@@ -35,7 +33,6 @@ def format_vacancy_item(vacancy: VacancySummary, index: int) -> str:
 def build_vacancy_messages(
     vacancies: tuple[VacancySummary, ...],
     *,
-    now: datetime | None = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
     max_length: int = 4096,
 ) -> list[str]:
@@ -43,7 +40,7 @@ def build_vacancy_messages(
     if not vacancies:
         return []
 
-    header = f"Вакансии на {(now or datetime.now()).strftime('%Y-%m-%d %H:%M')}"
+    header = "Свежие вакансии"
     messages: list[str] = []
     for start in range(0, len(vacancies), batch_size):
         cards = [
