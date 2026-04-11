@@ -3,10 +3,16 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+from telegram.error import TimedOut
+
 from tg_bot_hh.config import AppConfig
 from tg_bot_hh.hh_client import HHUnavailableError
 from tg_bot_hh.models import StartCommandResult, StopCommandResult
-from tg_bot_hh.telegram_app import _send_vacancy_batches, build_application
+from tg_bot_hh.telegram_app import (
+    _send_vacancy_batches,
+    _send_message_with_retry,
+    build_application,
+)
 
 
 class FakeBot:
@@ -43,22 +49,41 @@ class FakeApplication:
         self.bot_data = {}
         self.job_queue = FakeJobQueue()
         self.handlers = []
+        self.error_handlers = []
         self.post_init_callback = None
         self.post_shutdown_callback = None
 
     def add_handler(self, handler):
         self.handlers.append(handler)
 
+    def add_error_handler(self, handler):
+        self.error_handlers.append(handler)
+
 
 class FakeApplicationBuilder:
     def __init__(self):
         self._token = None
+        self._connect_timeout = None
+        self._read_timeout = None
+        self._write_timeout = None
         self._post_init = None
         self._post_shutdown = None
         self.application = FakeApplication()
 
     def token(self, token):
         self._token = token
+        return self
+
+    def connect_timeout(self, timeout):
+        self._connect_timeout = timeout
+        return self
+
+    def read_timeout(self, timeout):
+        self._read_timeout = timeout
+        return self
+
+    def write_timeout(self, timeout):
+        self._write_timeout = timeout
         return self
 
     def post_init(self, callback):
@@ -189,6 +214,38 @@ def test_send_vacancy_batches_sends_multiple_messages_by_ten(vacancy_factory):
 
     assert len(bot.messages) == 2
     assert all("Вакансии на" in text for _, text in bot.messages)
+
+
+def test_send_message_with_retry_succeeds_after_timeout(monkeypatch):
+    class FlakyBot:
+        def __init__(self):
+            self.calls = 0
+            self.messages = []
+
+        async def send_message(self, *, chat_id, text):
+            self.calls += 1
+            if self.calls == 1:
+                raise TimedOut("temporary timeout")
+            self.messages.append((chat_id, text))
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr("tg_bot_hh.telegram_app.asyncio.sleep", no_sleep)
+
+    bot = FlakyBot()
+    context = FakeContext(bot=bot)
+    sent = asyncio.run(
+        _send_message_with_retry(
+            context=context,
+            chat_id=123,
+            text="hello",
+        )
+    )
+
+    assert sent is True
+    assert bot.calls == 2
+    assert bot.messages == [(123, "hello")]
 
 
 def make_config() -> AppConfig:

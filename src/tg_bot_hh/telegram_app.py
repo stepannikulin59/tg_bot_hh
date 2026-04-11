@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import cast
 
 from telegram import Update
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 
 from .config import AppConfig
@@ -16,6 +18,32 @@ SERVICE_BOT_DATA_KEY = "vacancy_service"
 HH_OUTAGE_BOT_DATA_KEY = "hh_outage_active"
 
 
+async def _send_message_with_retry(
+    *,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    attempts: int = 3,
+    delay_seconds: float = 1.0,
+) -> bool:
+    for attempt in range(1, attempts + 1):
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text)
+            return True
+        except (TimedOut, NetworkError):
+            LOGGER.warning(
+                "Failed to send Telegram message to chat_id=%s (attempt %s/%s)",
+                chat_id,
+                attempt,
+                attempts,
+                exc_info=True,
+            )
+            if attempt >= attempts:
+                return False
+            await asyncio.sleep(delay_seconds)
+    return False
+
+
 async def _send_vacancy_batches(
     *,
     chat_id: int,
@@ -26,10 +54,20 @@ async def _send_vacancy_batches(
     messages = build_vacancy_messages(vacancies)
     if not messages:
         if send_empty_message:
-            await context.bot.send_message(chat_id=chat_id, text="Подходящих вакансий сейчас нет.")
+            await _send_message_with_retry(
+                context=context,
+                chat_id=chat_id,
+                text="Подходящих вакансий сейчас нет.",
+            )
         return
     for text in messages:
-        await context.bot.send_message(chat_id=chat_id, text=text)
+        sent = await _send_message_with_retry(
+            context=context,
+            chat_id=chat_id,
+            text=text,
+        )
+        if not sent:
+            break
 
 
 def _get_service(application: Application) -> VacancyBotService:
@@ -49,7 +87,7 @@ async def _notify_outage_once(
     if application.bot_data.get(HH_OUTAGE_BOT_DATA_KEY):
         return
     application.bot_data[HH_OUTAGE_BOT_DATA_KEY] = True
-    await context.bot.send_message(chat_id=chat_id, text=text)
+    await _send_message_with_retry(context=context, chat_id=chat_id, text=text)
 
 
 async def _notify_recovery_if_needed(
@@ -61,13 +99,17 @@ async def _notify_recovery_if_needed(
     if not application.bot_data.get(HH_OUTAGE_BOT_DATA_KEY):
         return
     application.bot_data[HH_OUTAGE_BOT_DATA_KEY] = False
-    await context.bot.send_message(
+    await _send_message_with_retry(
+        context=context,
         chat_id=chat_id,
         text="Связь с hh.ru восстановлена. Продолжаю автоопрос.",
     )
 
 
 def build_application(config: AppConfig) -> Application:
+    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        LOGGER.exception("Unhandled Telegram update error", exc_info=context.error)
+
     async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
         if chat is None:
@@ -79,21 +121,30 @@ def build_application(config: AppConfig) -> Application:
         except HHUnavailableError:
             LOGGER.warning("hh.ru is unavailable while processing /start", exc_info=True)
             context.application.bot_data[HH_OUTAGE_BOT_DATA_KEY] = True
-            await context.bot.send_message(
+            await _send_message_with_retry(
+                context=context,
                 chat_id=chat.id,
                 text="hh.ru временно недоступен. Автоопрос включен и продолжит попытки.",
             )
             return
         except Exception:
             LOGGER.exception("Failed to process /start")
-            await context.bot.send_message(chat_id=chat.id, text="Не удалось обработать /start.")
+            await _send_message_with_retry(
+                context=context,
+                chat_id=chat.id,
+                text="Не удалось обработать /start.",
+            )
             return
 
         if context.application.bot_data.get(HH_OUTAGE_BOT_DATA_KEY):
             context.application.bot_data[HH_OUTAGE_BOT_DATA_KEY] = False
 
         if result.message:
-            await context.bot.send_message(chat_id=chat.id, text=result.message)
+            await _send_message_with_retry(
+                context=context,
+                chat_id=chat.id,
+                text=result.message,
+            )
         if result.accepted:
             await _send_vacancy_batches(
                 chat_id=chat.id,
@@ -112,10 +163,18 @@ def build_application(config: AppConfig) -> Application:
             result = await service.handle_stop(chat.id)
         except Exception:
             LOGGER.exception("Failed to process /stop")
-            await context.bot.send_message(chat_id=chat.id, text="Не удалось обработать /stop.")
+            await _send_message_with_retry(
+                context=context,
+                chat_id=chat.id,
+                text="Не удалось обработать /stop.",
+            )
             return
 
-        await context.bot.send_message(chat_id=chat.id, text=result.message)
+        await _send_message_with_retry(
+            context=context,
+            chat_id=chat.id,
+            text=result.message,
+        )
 
     async def poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         application = context.application
@@ -173,10 +232,14 @@ def build_application(config: AppConfig) -> Application:
     application = (
         ApplicationBuilder()
         .token(config.telegram_bot_token)
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
     )
     application.add_handler(CommandHandler("start", start_handler))
     application.add_handler(CommandHandler("stop", stop_handler))
+    application.add_error_handler(error_handler)
     return application
