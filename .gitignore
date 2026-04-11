@@ -46,6 +46,7 @@ Thumbs.db
 state/
 state.json
 *.state.json
+PLAN.md
 
 # Docker local artifacts
 .docker/
