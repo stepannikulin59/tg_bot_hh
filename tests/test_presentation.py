@@ -31,7 +31,7 @@ def test_build_vacancy_messages_returns_empty_for_no_items():
     assert build_vacancy_messages(()) == []
 
 
-def test_build_vacancy_messages_splits_long_text(vacancy_factory):
+def test_build_vacancy_messages_keeps_single_batch_for_long_text(vacancy_factory):
     long_title = "Python " * 300
     vacancies = (
         vacancy_factory(
@@ -47,8 +47,5 @@ def test_build_vacancy_messages_splits_long_text(vacancy_factory):
         max_length=220,
     )
 
-    assert len(messages) > 1
-    assert all(
-        message.startswith("Вакансии на 2026-04-12 00:20")
-        for message in messages
-    )
+    assert len(messages) == 1
+    assert messages[0].startswith("Вакансии на 2026-04-12 00:20")

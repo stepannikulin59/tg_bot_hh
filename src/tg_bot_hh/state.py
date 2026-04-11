@@ -44,7 +44,3 @@ class StateStore:
             tmp_path = Path(tmp.name)
 
         os.replace(tmp_path, self.path)
-
-
-def add_seen_vacancy_id(state: BotState, vacancy_id: str) -> BotState:
-    return state.with_seen_vacancies([vacancy_id])

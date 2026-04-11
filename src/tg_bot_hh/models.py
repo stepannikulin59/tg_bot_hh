@@ -78,7 +78,6 @@ class BotState:
         seen = list(self.seen_vacancy_ids)
         seen_set = set(seen)
         added = False
-
         for vacancy_id in vacancy_ids:
             if vacancy_id in seen_set:
                 continue
@@ -89,14 +88,7 @@ class BotState:
         evicted = False
         while len(seen) > MAX_SEEN_VACANCIES:
             evicted = True
-            removed = seen.pop(0)
-            seen_set.discard(removed)
-
-        local_floor = self.pagination_floor_local
-        remote_floor = self.pagination_floor_remote
-        if evicted:
-            local_floor = None
-            remote_floor = None
+            seen_set.discard(seen.pop(0))
 
         if not added and not evicted:
             return self
@@ -104,21 +96,11 @@ class BotState:
         return replace(
             self,
             seen_vacancy_ids=tuple(seen),
-            pagination_floor_local=local_floor,
-            pagination_floor_remote=remote_floor,
+            pagination_floor_local=None if evicted else self.pagination_floor_local,
+            pagination_floor_remote=None if evicted else self.pagination_floor_remote,
         )
 
-    def with_chat_id(self, chat_id: int) -> "BotState":
-        return replace(self, chat_id=chat_id)
-
-    def with_polling_enabled(self, enabled: bool) -> "BotState":
-        return replace(self, polling_enabled=enabled)
-
-    def with_pagination_floor(
-        self,
-        branch: BranchName,
-        floor: str | None,
-    ) -> "BotState":
+    def with_pagination_floor(self, branch: BranchName, floor: str | None) -> "BotState":
         if branch == "local":
             return replace(self, pagination_floor_local=floor)
         return replace(self, pagination_floor_remote=floor)

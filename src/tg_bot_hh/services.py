@@ -2,15 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import replace
 
 from .config import AppConfig
-from .filters import (
-    merge_and_sort_vacancies,
-    page_stop_decision,
-    text_has_keyword,
-    title_has_keyword,
-)
+from .filters import merge_and_sort_vacancies, page_stop_decision, text_has_keyword, title_has_keyword
 from .hh_client import HHClient, HHUnavailableError
 from .models import (
     MAX_VACANCY_SEARCH_DEPTH,
@@ -26,29 +21,6 @@ from .models import (
 from .state import StateStore
 
 LOGGER = logging.getLogger(__name__)
-
-
-@dataclass(slots=True)
-class RequestBudget:
-    limit: int
-    used: int = 0
-
-    def consume(self) -> None:
-        if self.used >= self.limit:
-            raise RuntimeError("HH request budget exhausted")
-        self.used += 1
-
-    @property
-    def available(self) -> bool:
-        return self.used < self.limit
-
-
-@dataclass(frozen=True, slots=True)
-class BranchFetchResult:
-    branch: BranchName
-    vacancies: tuple[VacancySummary, ...]
-    min_published_at_raw: str | None
-    requested_any_page: bool
 
 
 class VacancyBotService:
@@ -76,16 +48,15 @@ class VacancyBotService:
         client: HHClient | None = None,
         state_store: StateStore | None = None,
     ) -> "VacancyBotService":
-        hh_client = client or HHClient(
-            base_url=config.hh_base_url,
-            user_agent=config.hh_user_agent,
-            timeout_seconds=config.http_timeout_seconds,
-        )
-        store = state_store or StateStore(config.state_path)
         return cls(
             config=config,
-            client=hh_client,
-            state_store=store,
+            client=client
+            or HHClient(
+                base_url=config.hh_base_url,
+                user_agent=config.hh_user_agent,
+                timeout_seconds=config.http_timeout_seconds,
+            ),
+            state_store=state_store or StateStore(config.state_path),
         )
 
     async def handle_start(self, chat_id: int) -> StartCommandResult:
@@ -93,20 +64,17 @@ class VacancyBotService:
         if state.chat_id is not None and state.chat_id != chat_id:
             return StartCommandResult(
                 accepted=False,
-                message=(
-                    "Бот персональный и уже привязан "
-                    "к другому чату."
-                ),
+                message="Бот персональный и уже привязан к другому чату.",
             )
 
         previous_state = state
-        state = state.with_chat_id(chat_id).with_polling_enabled(True)
+        state = replace(state, chat_id=chat_id, polling_enabled=True)
         self.state_store.save(state)
 
         try:
             vacancies, _ = await self._collect_matching_vacancies(
                 state=state,
-                budget=RequestBudget(self.config.hh_request_limit_per_cycle),
+                budget_left=self.config.hh_request_limit_per_cycle,
                 update_floors=False,
             )
         except HHUnavailableError:
@@ -115,34 +83,22 @@ class VacancyBotService:
             self.state_store.save(previous_state)
             raise
 
-        selected = vacancies[:10]
-        state = state.with_seen_vacancies([item.vacancy_id for item in selected])
-        self.state_store.save(state)
-
-        return StartCommandResult(
-            accepted=True,
-            message=None,
-            vacancies=tuple(selected),
-        )
+        selected = tuple(vacancies[:10])
+        self.state_store.save(state.with_seen_vacancies([item.vacancy_id for item in selected]))
+        return StartCommandResult(accepted=True, message=None, vacancies=selected)
 
     async def handle_stop(self, chat_id: int) -> StopCommandResult:
         state = self.state_store.load()
         if state.chat_id != chat_id:
             return StopCommandResult(
                 accepted=False,
-                message=(
-                    "Останавливать автоопрос может только "
-                    "владелец этого бота."
-                ),
+                message="Останавливать автоопрос может только владелец этого бота.",
             )
 
-        self.state_store.save(state.with_polling_enabled(False))
+        self.state_store.save(replace(state, polling_enabled=False))
         return StopCommandResult(
             accepted=True,
-            message=(
-                "Автоопрос остановлен до "
-                "следующего /start."
-            ),
+            message="Автоопрос остановлен до следующего /start.",
         )
 
     async def run_poll_cycle(self) -> tuple[VacancySummary, ...]:
@@ -152,7 +108,7 @@ class VacancyBotService:
 
         vacancies, state = await self._collect_matching_vacancies(
             state=state,
-            budget=RequestBudget(self.config.hh_request_limit_per_cycle),
+            budget_left=self.config.hh_request_limit_per_cycle,
             update_floors=True,
         )
 
@@ -160,7 +116,6 @@ class VacancyBotService:
         unseen = tuple(item for item in vacancies if item.vacancy_id not in seen_ids)
         if unseen:
             state = state.with_seen_vacancies([item.vacancy_id for item in unseen])
-
         self.state_store.save(state)
         return unseen
 
@@ -168,55 +123,42 @@ class VacancyBotService:
         self,
         *,
         state: BotState,
-        budget: RequestBudget,
+        budget_left: int,
         update_floors: bool,
     ) -> tuple[tuple[VacancySummary, ...], BotState]:
         await self._ensure_search_filters()
         details_cache: dict[str, VacancyDetails] = {}
 
-        local_result = await self._fetch_branch(
+        local_vacancies, local_floor, local_requested, budget_left = await self._fetch_branch(
             branch="local",
             state=state,
-            budget=budget,
+            budget_left=budget_left,
             details_cache=details_cache,
         )
-        remote_result = await self._fetch_branch(
+        remote_vacancies, remote_floor, remote_requested, _ = await self._fetch_branch(
             branch="remote",
             state=state,
-            budget=budget,
+            budget_left=budget_left,
             details_cache=details_cache,
         )
 
-        merged = merge_and_sort_vacancies(
-            local_result.vacancies,
-            remote_result.vacancies,
-        )
         if update_floors:
-            if local_result.requested_any_page:
-                state = state.with_pagination_floor(
-                    "local",
-                    local_result.min_published_at_raw,
-                )
-            if remote_result.requested_any_page:
-                state = state.with_pagination_floor(
-                    "remote",
-                    remote_result.min_published_at_raw,
-                )
+            if local_requested:
+                state = state.with_pagination_floor("local", local_floor)
+            if remote_requested:
+                state = state.with_pagination_floor("remote", remote_floor)
 
-        return merged, state
+        return merge_and_sort_vacancies(local_vacancies, remote_vacancies), state
 
     async def _ensure_search_filters(self) -> None:
         if self.area_id is not None and self.remote_schedule_id is not None:
             return
-
         if self._lookup_init_lock is None:
             self._lookup_init_lock = asyncio.Lock()
 
         async with self._lookup_init_lock:
             if self.area_id is None:
-                self.area_id = await self.client.resolve_area_id(
-                    self.config.target_area_name
-                )
+                self.area_id = await self.client.resolve_area_id(self.config.target_area_name)
             if self.remote_schedule_id is None:
                 self.remote_schedule_id = await self.client.resolve_remote_schedule_id()
 
@@ -225,36 +167,27 @@ class VacancyBotService:
         *,
         branch: BranchName,
         state: BotState,
-        budget: RequestBudget,
+        budget_left: int,
         details_cache: dict[str, VacancyDetails],
-    ) -> BranchFetchResult:
+    ) -> tuple[tuple[VacancySummary, ...], str | None, bool, int]:
         page = 0
         matched: list[VacancySummary] = []
         min_published_at_raw: str | None = None
         requested_any_page = False
 
         seen_ids = set(state.seen_vacancy_ids)
-        floor = (
-            state.pagination_floor_local
-            if branch == "local"
-            else state.pagination_floor_remote
-        )
+        floor = state.pagination_floor_local if branch == "local" else state.pagination_floor_remote
         if branch == "local":
             if self.area_id is None:
                 raise RuntimeError("local area id is not initialized")
-            area_id = self.area_id
-            schedule_id = None
+            area_id, schedule_id = self.area_id, None
         else:
             if self.remote_schedule_id is None:
                 raise RuntimeError("remote schedule id is not initialized")
-            area_id = None
-            schedule_id = self.remote_schedule_id
+            area_id, schedule_id = None, self.remote_schedule_id
 
-        while (
-            budget.available
-            and page * self.config.page_size < MAX_VACANCY_SEARCH_DEPTH
-        ):
-            budget.consume()
+        while budget_left > 0 and page * self.config.page_size < MAX_VACANCY_SEARCH_DEPTH:
+            budget_left -= 1
             requested_any_page = True
             search_page = await self.client.search_vacancies(
                 page=page,
@@ -265,70 +198,55 @@ class VacancyBotService:
             if not search_page.items:
                 break
 
-            page_min_raw = min(
+            all_seen, floor_reached_without_new, page_min_raw = page_stop_decision(
                 search_page.items,
-                key=lambda item: item.published_at,
-            ).published_at_raw
-            if min_published_at_raw is None:
-                min_published_at_raw = page_min_raw
-            elif parse_hh_datetime(page_min_raw) < parse_hh_datetime(
-                min_published_at_raw
+                seen_ids,
+                floor,
+            )
+            if page_min_raw is not None and (
+                min_published_at_raw is None
+                or parse_hh_datetime(page_min_raw) < parse_hh_datetime(min_published_at_raw)
             ):
                 min_published_at_raw = page_min_raw
 
-            matched.extend(
-                await self._select_matching_vacancies(
-                    search_page=search_page,
-                    budget=budget,
-                    details_cache=details_cache,
-                )
+            selected, budget_left = await self._select_matching_vacancies(
+                search_page=search_page,
+                budget_left=budget_left,
+                details_cache=details_cache,
             )
+            matched.extend(selected)
 
-            decision = page_stop_decision(search_page.items, seen_ids, floor)
-            if decision.all_seen or decision.floor_reached_without_new:
+            if all_seen or floor_reached_without_new:
                 break
             page += 1
 
         if page * self.config.page_size >= MAX_VACANCY_SEARCH_DEPTH:
-            LOGGER.warning(
-                "Stopping %s branch due to hh pagination depth limit",
-                branch,
-            )
+            LOGGER.warning("Stopping %s branch due to hh pagination depth limit", branch)
 
-        return BranchFetchResult(
-            branch=branch,
-            vacancies=tuple(matched),
-            min_published_at_raw=min_published_at_raw,
-            requested_any_page=requested_any_page,
-        )
+        return tuple(matched), min_published_at_raw, requested_any_page, budget_left
 
     async def _select_matching_vacancies(
         self,
         *,
         search_page: SearchPage,
-        budget: RequestBudget,
+        budget_left: int,
         details_cache: dict[str, VacancyDetails],
-    ) -> list[VacancySummary]:
+    ) -> tuple[list[VacancySummary], int]:
         matched: list[VacancySummary] = []
-
         for vacancy in search_page.items:
-            if title_has_keyword(vacancy.name):
-                matched.append(vacancy)
-                continue
-
-            if text_has_keyword(vacancy.name, vacancy.snippet_text):
+            if title_has_keyword(vacancy.name) or text_has_keyword(vacancy.name, vacancy.snippet_text):
                 matched.append(vacancy)
                 continue
 
             details = details_cache.get(vacancy.vacancy_id)
             if details is None:
-                if not budget.available:
+                if budget_left <= 0:
                     break
-                budget.consume()
+                budget_left -= 1
                 details = await self.client.get_vacancy_details(vacancy.vacancy_id)
                 details_cache[vacancy.vacancy_id] = details
 
             if text_has_keyword(vacancy.name, details.description):
                 matched.append(vacancy)
 
-        return matched
+        return matched, budget_left

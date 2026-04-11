@@ -26,12 +26,8 @@ async def _send_vacancy_batches(
     messages = build_vacancy_messages(vacancies)
     if not messages:
         if send_empty_message:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="Подходящих вакансий сейчас нет.",
-            )
+            await context.bot.send_message(chat_id=chat_id, text="Подходящих вакансий сейчас нет.")
         return
-
     for text in messages:
         await context.bot.send_message(chat_id=chat_id, text=text)
 
@@ -43,12 +39,32 @@ def _get_service(application: Application) -> VacancyBotService:
     return cast(VacancyBotService, service)
 
 
-def _set_hh_outage_active(application: Application, active: bool) -> None:
-    application.bot_data[HH_OUTAGE_BOT_DATA_KEY] = active
+async def _notify_outage_once(
+    application: Application,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    text: str,
+) -> None:
+    if application.bot_data.get(HH_OUTAGE_BOT_DATA_KEY):
+        return
+    application.bot_data[HH_OUTAGE_BOT_DATA_KEY] = True
+    await context.bot.send_message(chat_id=chat_id, text=text)
 
 
-def _is_hh_outage_active(application: Application) -> bool:
-    return bool(application.bot_data.get(HH_OUTAGE_BOT_DATA_KEY, False))
+async def _notify_recovery_if_needed(
+    application: Application,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+) -> None:
+    if not application.bot_data.get(HH_OUTAGE_BOT_DATA_KEY):
+        return
+    application.bot_data[HH_OUTAGE_BOT_DATA_KEY] = False
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="Связь с hh.ru восстановлена. Продолжаю автоопрос.",
+    )
 
 
 def build_application(config: AppConfig) -> Application:
@@ -62,29 +78,22 @@ def build_application(config: AppConfig) -> Application:
             result = await service.handle_start(chat.id)
         except HHUnavailableError:
             LOGGER.warning("hh.ru is unavailable while processing /start", exc_info=True)
-            _set_hh_outage_active(context.application, True)
+            context.application.bot_data[HH_OUTAGE_BOT_DATA_KEY] = True
             await context.bot.send_message(
                 chat_id=chat.id,
-                text=(
-                    "hh.ru временно недоступен. "
-                    "Автоопрос включен и продолжит попытки."
-                ),
+                text="hh.ru временно недоступен. Автоопрос включен и продолжит попытки.",
             )
             return
         except Exception:
             LOGGER.exception("Failed to process /start")
-            await context.bot.send_message(
-                chat_id=chat.id,
-                text="Не удалось обработать /start.",
-            )
+            await context.bot.send_message(chat_id=chat.id, text="Не удалось обработать /start.")
             return
 
-        if _is_hh_outage_active(context.application):
-            _set_hh_outage_active(context.application, False)
+        if context.application.bot_data.get(HH_OUTAGE_BOT_DATA_KEY):
+            context.application.bot_data[HH_OUTAGE_BOT_DATA_KEY] = False
 
         if result.message:
             await context.bot.send_message(chat_id=chat.id, text=result.message)
-
         if result.accepted:
             await _send_vacancy_batches(
                 chat_id=chat.id,
@@ -103,10 +112,7 @@ def build_application(config: AppConfig) -> Application:
             result = await service.handle_stop(chat.id)
         except Exception:
             LOGGER.exception("Failed to process /stop")
-            await context.bot.send_message(
-                chat_id=chat.id,
-                text="Не удалось обработать /stop.",
-            )
+            await context.bot.send_message(chat_id=chat.id, text="Не удалось обработать /stop.")
             return
 
         await context.bot.send_message(chat_id=chat.id, text=result.message)
@@ -121,27 +127,20 @@ def build_application(config: AppConfig) -> Application:
         try:
             vacancies = await service.run_poll_cycle()
         except HHUnavailableError:
-            if not _is_hh_outage_active(application):
-                _set_hh_outage_active(application, True)
-                await context.bot.send_message(
-                    chat_id=state.chat_id,
-                    text="hh.ru временно недоступен. Продолжаю попытки автоопроса.",
-                )
+            await _notify_outage_once(
+                application,
+                context,
+                chat_id=state.chat_id,
+                text="hh.ru временно недоступен. Продолжаю попытки автоопроса.",
+            )
             return
         except Exception:
             LOGGER.exception("Polling cycle failed")
             return
 
-        if _is_hh_outage_active(application):
-            _set_hh_outage_active(application, False)
-            await context.bot.send_message(
-                chat_id=state.chat_id,
-                text="Связь с hh.ru восстановлена. Продолжаю автоопрос.",
-            )
-
+        await _notify_recovery_if_needed(application, context, chat_id=state.chat_id)
         if not vacancies:
             return
-
         await _send_vacancy_batches(
             chat_id=state.chat_id,
             context=context,
@@ -151,14 +150,10 @@ def build_application(config: AppConfig) -> Application:
 
     async def post_init(application: Application) -> None:
         if application.job_queue is None:
-            raise RuntimeError(
-                "python-telegram-bot must be installed with job-queue support"
-            )
+            raise RuntimeError("python-telegram-bot must be installed with job-queue support")
 
-        service = await VacancyBotService.build(config=config)
-        application.bot_data[SERVICE_BOT_DATA_KEY] = service
-        _set_hh_outage_active(application, False)
-
+        application.bot_data[SERVICE_BOT_DATA_KEY] = await VacancyBotService.build(config=config)
+        application.bot_data[HH_OUTAGE_BOT_DATA_KEY] = False
         application.job_queue.run_repeating(
             poll_job,
             interval=config.poll_interval_seconds,
@@ -170,7 +165,6 @@ def build_application(config: AppConfig) -> Application:
         service = application.bot_data.get(SERVICE_BOT_DATA_KEY)
         if service is None:
             return
-
         try:
             await cast(VacancyBotService, service).client.aclose()
         except Exception:

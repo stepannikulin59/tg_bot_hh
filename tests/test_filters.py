@@ -71,15 +71,15 @@ def test_page_stop_decision_uses_floor_only_without_unseen(vacancy_factory):
         ),
     )
 
-    decision = page_stop_decision(
+    all_seen, floor_reached_without_new, min_published_at_raw = page_stop_decision(
         items=items,
         seen_ids={"seen-1", "seen-2"},
         pagination_floor="2026-04-11T10:30:00+03:00",
     )
 
-    assert decision.all_seen is True
-    assert decision.floor_reached_without_new is True
-    assert decision.min_published_at_raw == "2026-04-11T10:00:00+03:00"
+    assert all_seen is True
+    assert floor_reached_without_new is True
+    assert min_published_at_raw == "2026-04-11T10:00:00+03:00"
 
 
 def test_page_stop_decision_does_not_stop_when_unseen_exists(vacancy_factory):
@@ -94,11 +94,11 @@ def test_page_stop_decision_does_not_stop_when_unseen_exists(vacancy_factory):
         ),
     )
 
-    decision = page_stop_decision(
+    all_seen, floor_reached_without_new, _ = page_stop_decision(
         items=items,
         seen_ids={"seen-1"},
         pagination_floor="2026-04-11T11:30:00+03:00",
     )
 
-    assert decision.all_seen is False
-    assert decision.floor_reached_without_new is False
+    assert all_seen is False
+    assert floor_reached_without_new is False
