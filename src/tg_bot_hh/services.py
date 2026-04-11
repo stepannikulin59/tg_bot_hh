@@ -11,7 +11,7 @@ from .filters import (
     text_has_keyword,
     title_has_keyword,
 )
-from .hh_client import HHClient
+from .hh_client import HHClient, HHUnavailableError
 from .models import (
     MAX_VACANCY_SEARCH_DEPTH,
     BotState,
@@ -99,14 +99,22 @@ class VacancyBotService:
                 ),
             )
 
+        previous_state = state
         state = state.with_chat_id(chat_id).with_polling_enabled(True)
         self.state_store.save(state)
 
-        vacancies, _ = await self._collect_matching_vacancies(
-            state=state,
-            budget=RequestBudget(self.config.hh_request_limit_per_cycle),
-            update_floors=False,
-        )
+        try:
+            vacancies, _ = await self._collect_matching_vacancies(
+                state=state,
+                budget=RequestBudget(self.config.hh_request_limit_per_cycle),
+                update_floors=False,
+            )
+        except HHUnavailableError:
+            raise
+        except Exception:
+            self.state_store.save(previous_state)
+            raise
+
         selected = vacancies[:10]
         state = state.with_seen_vacancies([item.vacancy_id for item in selected])
         self.state_store.save(state)

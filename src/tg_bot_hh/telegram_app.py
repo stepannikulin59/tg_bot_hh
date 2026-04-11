@@ -79,6 +79,9 @@ def build_application(config: AppConfig) -> Application:
             )
             return
 
+        if _is_hh_outage_active(context.application):
+            _set_hh_outage_active(context.application, False)
+
         if result.message:
             await context.bot.send_message(chat_id=chat.id, text=result.message)
 

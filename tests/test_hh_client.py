@@ -5,8 +5,9 @@ import json
 from urllib.parse import parse_qs
 
 import httpx
+import pytest
 
-from tg_bot_hh.hh_client import AreaResolutionError, HHClient
+from tg_bot_hh.hh_client import AreaResolutionError, HHClient, HHUnavailableError
 
 
 def build_client(handler):
@@ -138,3 +139,37 @@ def test_resolve_area_id_requires_single_leaf_match():
         assert "matched multiple leaf ids" in str(exc)
     else:
         raise AssertionError("Expected AreaResolutionError for duplicate city names")
+
+
+def test_client_wraps_transport_errors_as_hh_unavailable():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectTimeout("network timeout")
+
+    client = build_client(handler)
+
+    with pytest.raises(HHUnavailableError):
+        asyncio.run(
+            client.search_vacancies(
+                page=0,
+                per_page=100,
+                area_id="72",
+                schedule_id=None,
+            )
+        )
+
+
+def test_client_treats_503_as_hh_unavailable():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"errors": [{"type": "service_unavailable"}]})
+
+    client = build_client(handler)
+
+    with pytest.raises(HHUnavailableError):
+        asyncio.run(
+            client.search_vacancies(
+                page=0,
+                per_page=100,
+                area_id="72",
+                schedule_id=None,
+            )
+        )

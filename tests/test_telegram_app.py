@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
-from tg_bot_hh.telegram_app import _send_vacancy_batches
+from tg_bot_hh.config import AppConfig
+from tg_bot_hh.hh_client import HHUnavailableError
+from tg_bot_hh.models import StartCommandResult, StopCommandResult
+from tg_bot_hh.telegram_app import _send_vacancy_batches, build_application
 
 
 class FakeBot:
@@ -14,8 +18,118 @@ class FakeBot:
 
 
 class FakeContext:
-    def __init__(self, bot):
+    def __init__(self, bot, application=None):
         self.bot = bot
+        self.application = application
+
+
+class FakeJobQueue:
+    def __init__(self):
+        self.calls = []
+
+    def run_repeating(self, callback, interval, first, name):
+        self.calls.append(
+            {
+                "callback": callback,
+                "interval": interval,
+                "first": first,
+                "name": name,
+            }
+        )
+
+
+class FakeApplication:
+    def __init__(self):
+        self.bot_data = {}
+        self.job_queue = FakeJobQueue()
+        self.handlers = []
+        self.post_init_callback = None
+        self.post_shutdown_callback = None
+
+    def add_handler(self, handler):
+        self.handlers.append(handler)
+
+
+class FakeApplicationBuilder:
+    def __init__(self):
+        self._token = None
+        self._post_init = None
+        self._post_shutdown = None
+        self.application = FakeApplication()
+
+    def token(self, token):
+        self._token = token
+        return self
+
+    def post_init(self, callback):
+        self._post_init = callback
+        return self
+
+    def post_shutdown(self, callback):
+        self._post_shutdown = callback
+        return self
+
+    def build(self):
+        self.application.post_init_callback = self._post_init
+        self.application.post_shutdown_callback = self._post_shutdown
+        return self.application
+
+
+class StaticStateStore:
+    def __init__(self, state):
+        self._state = state
+
+    def load(self):
+        return self._state
+
+
+class RuntimeServiceStub:
+    def __init__(
+        self,
+        *,
+        config,
+        state_store,
+        poll_results,
+        start_result=None,
+        start_error=None,
+        stop_result=None,
+    ):
+        self.config = config
+        self.state_store = state_store
+        self._poll_results = list(poll_results)
+        self._poll_index = 0
+        self._start_result = start_result or StartCommandResult(
+            accepted=True,
+            message=None,
+            vacancies=(),
+        )
+        self._start_error = start_error
+        self._stop_result = stop_result or StopCommandResult(
+            accepted=True,
+            message="stopped",
+        )
+        self.start_calls = []
+        self.client = self._ClientStub()
+
+    class _ClientStub:
+        async def aclose(self):
+            return None
+
+    async def run_poll_cycle(self):
+        result = self._poll_results[self._poll_index]
+        self._poll_index += 1
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    async def handle_start(self, chat_id):
+        self.start_calls.append(chat_id)
+        if self._start_error is not None:
+            raise self._start_error
+        return self._start_result
+
+    async def handle_stop(self, chat_id):
+        return self._stop_result
 
 
 def test_send_vacancy_batches_does_not_send_empty_when_disabled():
@@ -75,3 +189,134 @@ def test_send_vacancy_batches_sends_multiple_messages_by_ten(vacancy_factory):
 
     assert len(bot.messages) == 2
     assert all("Вакансии на" in text for _, text in bot.messages)
+
+
+def make_config() -> AppConfig:
+    return AppConfig(
+        telegram_bot_token="token",
+        hh_user_agent="agent",
+        target_area_name="Пермь",
+        state_path=Path("state.json"),
+        poll_interval_seconds=300,
+        hh_request_limit_per_cycle=60,
+    )
+
+
+def test_build_application_creates_service_in_post_init(monkeypatch, state_factory):
+    config = make_config()
+    fake_builder = FakeApplicationBuilder()
+    built_service = RuntimeServiceStub(
+        config=config,
+        state_store=StaticStateStore(state_factory()),
+        poll_results=[()],
+    )
+    build_calls = []
+
+    class FakeVacancyBotService:
+        @classmethod
+        async def build(cls, *, config, client=None, state_store=None):
+            build_calls.append(config)
+            return built_service
+
+    monkeypatch.setattr("tg_bot_hh.telegram_app.ApplicationBuilder", lambda: fake_builder)
+    monkeypatch.setattr("tg_bot_hh.telegram_app.VacancyBotService", FakeVacancyBotService)
+
+    app = build_application(config)
+
+    assert app is fake_builder.application
+    assert build_calls == []
+
+    asyncio.run(app.post_init_callback(app))
+
+    assert build_calls == [config]
+    assert app.job_queue.calls[0]["interval"] == config.poll_interval_seconds
+
+
+def test_poll_job_notifies_hh_outage_once_and_reports_recovery(
+    monkeypatch,
+    state_factory,
+    vacancy_factory,
+):
+    config = make_config()
+    state = state_factory(chat_id=12345, polling_enabled=True)
+    vacancy = vacancy_factory(vacancy_id="vac-1", name="Python Vacancy")
+    fake_service = RuntimeServiceStub(
+        config=config,
+        state_store=StaticStateStore(state),
+        poll_results=[
+            HHUnavailableError("temporary outage"),
+            HHUnavailableError("temporary outage"),
+            (vacancy,),
+        ],
+    )
+    fake_builder = FakeApplicationBuilder()
+
+    class FakeVacancyBotService:
+        @classmethod
+        async def build(cls, *, config, client=None, state_store=None):
+            return fake_service
+
+    monkeypatch.setattr("tg_bot_hh.telegram_app.ApplicationBuilder", lambda: fake_builder)
+    monkeypatch.setattr("tg_bot_hh.telegram_app.VacancyBotService", FakeVacancyBotService)
+
+    app = build_application(config)
+    asyncio.run(app.post_init_callback(app))
+
+    poll_job = app.job_queue.calls[0]["callback"]
+    bot = FakeBot()
+    context = FakeContext(bot=bot, application=app)
+
+    async def run_poll_cycles():
+        await poll_job(context)
+        await poll_job(context)
+        await poll_job(context)
+
+    asyncio.run(run_poll_cycles())
+
+    texts = [text for _, text in bot.messages]
+    assert sum("временно недоступен" in text for text in texts) == 1
+    assert sum("восстановлена" in text for text in texts) == 1
+    assert any("Вакансии на" in text for text in texts)
+
+
+def test_start_handler_clears_outage_flag_on_success(
+    monkeypatch,
+    state_factory,
+):
+    config = make_config()
+    state = state_factory(chat_id=12345, polling_enabled=True)
+    fake_service = RuntimeServiceStub(
+        config=config,
+        state_store=StaticStateStore(state),
+        poll_results=[()],
+    )
+    fake_builder = FakeApplicationBuilder()
+
+    class FakeVacancyBotService:
+        @classmethod
+        async def build(cls, *, config, client=None, state_store=None):
+            return fake_service
+
+    monkeypatch.setattr("tg_bot_hh.telegram_app.ApplicationBuilder", lambda: fake_builder)
+    monkeypatch.setattr("tg_bot_hh.telegram_app.VacancyBotService", FakeVacancyBotService)
+
+    app = build_application(config)
+    asyncio.run(app.post_init_callback(app))
+    app.bot_data["hh_outage_active"] = True
+
+    start_handler = next(
+        handler.callback for handler in app.handlers if "start" in handler.commands
+    )
+
+    class FakeChat:
+        def __init__(self, chat_id):
+            self.id = chat_id
+
+    class FakeUpdate:
+        def __init__(self, chat_id):
+            self.effective_chat = FakeChat(chat_id)
+
+    context = FakeContext(bot=FakeBot(), application=app)
+    asyncio.run(start_handler(FakeUpdate(12345), context))
+
+    assert app.bot_data["hh_outage_active"] is False

@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from tg_bot_hh.config import AppConfig
+from tg_bot_hh.hh_client import HHUnavailableError
 from tg_bot_hh.models import SearchPage, VacancyDetails
 from tg_bot_hh.services import VacancyBotService
 
@@ -20,13 +23,36 @@ class InMemoryStateStore:
 
 
 class FakeHHClient:
-    def __init__(self, pages, details=None):
+    def __init__(
+        self,
+        pages,
+        details=None,
+        *,
+        area_id="72",
+        remote_schedule_id="remote",
+        search_error=None,
+    ):
         self.pages = pages
         self.details = details or {}
+        self.area_id = area_id
+        self.remote_schedule_id = remote_schedule_id
+        self.search_error = search_error
         self.search_calls = []
         self.detail_calls = []
+        self.resolve_area_calls = []
+        self.resolve_remote_calls = 0
+
+    async def resolve_area_id(self, area_name):
+        self.resolve_area_calls.append(area_name)
+        return self.area_id
+
+    async def resolve_remote_schedule_id(self):
+        self.resolve_remote_calls += 1
+        return self.remote_schedule_id
 
     async def search_vacancies(self, *, page, per_page, area_id, schedule_id):
+        if self.search_error is not None:
+            raise self.search_error
         self.search_calls.append((area_id, schedule_id, page, per_page))
         return self.pages.get(
             (area_id, schedule_id, page),
@@ -249,3 +275,75 @@ def test_poll_cycle_stops_branch_when_all_items_seen(state_factory, vacancy_fact
     assert unseen == ()
     local_calls = [call for call in client.search_calls if call[0] == "72"]
     assert [call[2] for call in local_calls] == [0]
+
+
+def test_start_persists_owner_when_hh_temporarily_unavailable(state_factory):
+    pages = {
+        ("72", None, 0): make_search_page([], page=0),
+        (None, "remote", 0): make_search_page([], page=0),
+    }
+    initial_state = state_factory()
+    service = VacancyBotService(
+        config=make_config(),
+        client=FakeHHClient(
+            pages,
+            search_error=HHUnavailableError("hh is down"),
+        ),
+        state_store=InMemoryStateStore(initial_state),
+        area_id="72",
+        remote_schedule_id="remote",
+    )
+
+    with pytest.raises(HHUnavailableError):
+        asyncio.run(service.handle_start(12345))
+
+    state = service.state_store.load()
+    assert state.chat_id == 12345
+    assert state.polling_enabled is True
+
+
+def test_start_rolls_back_state_on_non_hh_error(state_factory):
+    pages = {
+        ("72", None, 0): make_search_page([], page=0),
+        (None, "remote", 0): make_search_page([], page=0),
+    }
+    initial_state = state_factory(chat_id=None, polling_enabled=False)
+    service = VacancyBotService(
+        config=make_config(),
+        client=FakeHHClient(
+            pages,
+            search_error=RuntimeError("broken parser"),
+        ),
+        state_store=InMemoryStateStore(initial_state),
+        area_id="72",
+        remote_schedule_id="remote",
+    )
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(service.handle_start(12345))
+
+    state = service.state_store.load()
+    assert state.chat_id is None
+    assert state.polling_enabled is False
+
+
+def test_service_resolves_branch_filters_lazily_once(state_factory):
+    pages = {
+        ("72", None, 0): make_search_page([], page=0),
+        (None, "remote", 0): make_search_page([], page=0),
+    }
+    client = FakeHHClient(pages)
+    service = VacancyBotService(
+        config=make_config(),
+        client=client,
+        state_store=InMemoryStateStore(state_factory()),
+    )
+
+    async def run_scenario():
+        await service.handle_start(12345)
+        await service.handle_start(12345)
+
+    asyncio.run(run_scenario())
+
+    assert client.resolve_area_calls == ["Пермь"]
+    assert client.resolve_remote_calls == 1
