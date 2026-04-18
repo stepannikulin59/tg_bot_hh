@@ -7,7 +7,12 @@ from urllib.parse import parse_qs
 import httpx
 import pytest
 
-from tg_bot_hh.hh_client import AreaResolutionError, HHClient, HHUnavailableError
+from tg_bot_hh.hh_client import (
+    AreaResolutionError,
+    HHClient,
+    HHForbiddenError,
+    HHUnavailableError,
+)
 
 
 def build_client(handler):
@@ -165,6 +170,23 @@ def test_client_treats_503_as_hh_unavailable():
     client = build_client(handler)
 
     with pytest.raises(HHUnavailableError):
+        asyncio.run(
+            client.search_vacancies(
+                page=0,
+                per_page=100,
+                area_id="72",
+                schedule_id=None,
+            )
+        )
+
+
+def test_client_treats_403_as_hh_forbidden():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"description": "forbidden"})
+
+    client = build_client(handler)
+
+    with pytest.raises(HHForbiddenError):
         asyncio.run(
             client.search_vacancies(
                 page=0,

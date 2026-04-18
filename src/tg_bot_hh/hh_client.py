@@ -27,6 +27,10 @@ class HHUnavailableError(HHClientError):
     """Raised when hh.ru is temporarily unavailable."""
 
 
+class HHForbiddenError(HHClientError):
+    """Raised when hh.ru forbids access for current request profile."""
+
+
 class AreaResolutionError(HHClientError):
     """Raised when a city cannot be resolved to a single leaf area."""
 
@@ -174,6 +178,10 @@ class HHClient:
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
                 status_code = exc.response.status_code
+                if status_code == 403:
+                    raise HHForbiddenError(
+                        f"hh.ru rejected access for {method} {path}; status=403"
+                    ) from exc
                 if status_code == 429 or status_code == 408 or status_code >= 500:
                     raise HHUnavailableError(
                         f"hh.ru is unavailable for {method} {path}; status={status_code}"

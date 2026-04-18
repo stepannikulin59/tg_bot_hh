@@ -9,13 +9,28 @@ from telegram.error import NetworkError, TimedOut
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 
 from .config import AppConfig
-from .hh_client import HHUnavailableError
+from .hh_client import HHClientError, HHForbiddenError, HHUnavailableError
 from .presentation import build_vacancy_messages
 from .services import VacancyBotService
 
 LOGGER = logging.getLogger(__name__)
 SERVICE_BOT_DATA_KEY = "vacancy_service"
-HH_OUTAGE_BOT_DATA_KEY = "hh_outage_active"
+ERROR_ALERT_ACTIVE_BOT_DATA_KEY = "error_alert_active"
+ERROR_ALERT_KIND_BOT_DATA_KEY = "error_alert_kind"
+
+
+def _classify_runtime_error(exc: Exception) -> tuple[str, str]:
+    if isinstance(exc, HHForbiddenError):
+        return (
+            "hh_forbidden",
+            "hh.ru отклонил доступ (403). Проверьте HH_USER_AGENT и лимиты запросов.",
+        )
+    if isinstance(exc, HHUnavailableError):
+        return (
+            "hh_unavailable",
+            "hh.ru временно недоступен. Продолжаю попытки автоопроса.",
+        )
+    return ("unknown", "Произошла ошибка автоопроса. Продолжаю попытки.")
 
 
 async def _send_message_with_retry(
@@ -82,11 +97,15 @@ async def _notify_outage_once(
     context: ContextTypes.DEFAULT_TYPE,
     *,
     chat_id: int,
+    kind: str,
     text: str,
 ) -> None:
-    if application.bot_data.get(HH_OUTAGE_BOT_DATA_KEY):
+    active = bool(application.bot_data.get(ERROR_ALERT_ACTIVE_BOT_DATA_KEY))
+    current_kind = application.bot_data.get(ERROR_ALERT_KIND_BOT_DATA_KEY)
+    if active and current_kind == kind:
         return
-    application.bot_data[HH_OUTAGE_BOT_DATA_KEY] = True
+    application.bot_data[ERROR_ALERT_ACTIVE_BOT_DATA_KEY] = True
+    application.bot_data[ERROR_ALERT_KIND_BOT_DATA_KEY] = kind
     await _send_message_with_retry(context=context, chat_id=chat_id, text=text)
 
 
@@ -96,13 +115,14 @@ async def _notify_recovery_if_needed(
     *,
     chat_id: int,
 ) -> None:
-    if not application.bot_data.get(HH_OUTAGE_BOT_DATA_KEY):
+    if not application.bot_data.get(ERROR_ALERT_ACTIVE_BOT_DATA_KEY):
         return
-    application.bot_data[HH_OUTAGE_BOT_DATA_KEY] = False
+    application.bot_data[ERROR_ALERT_ACTIVE_BOT_DATA_KEY] = False
+    application.bot_data[ERROR_ALERT_KIND_BOT_DATA_KEY] = None
     await _send_message_with_retry(
         context=context,
         chat_id=chat_id,
-        text="Связь с hh.ru восстановлена. Продолжаю автоопрос.",
+        text="Работа автоопроса восстановлена.",
     )
 
 
@@ -118,13 +138,27 @@ def build_application(config: AppConfig) -> Application:
         service = _get_service(context.application)
         try:
             result = await service.handle_start(chat.id)
+        except HHForbiddenError:
+            await _send_message_with_retry(
+                context=context,
+                chat_id=chat.id,
+                text="hh.ru отклонил доступ (403). Проверьте HH_USER_AGENT и попробуйте позже.",
+            )
+            return
         except HHUnavailableError:
             LOGGER.warning("hh.ru is unavailable while processing /start", exc_info=True)
-            context.application.bot_data[HH_OUTAGE_BOT_DATA_KEY] = True
             await _send_message_with_retry(
                 context=context,
                 chat_id=chat.id,
                 text="hh.ru временно недоступен. Автоопрос включен и продолжит попытки.",
+            )
+            return
+        except HHClientError:
+            LOGGER.warning("hh.ru client error while processing /start", exc_info=True)
+            await _send_message_with_retry(
+                context=context,
+                chat_id=chat.id,
+                text="Ошибка при запросе к hh.ru. Попробуйте позже.",
             )
             return
         except Exception:
@@ -135,9 +169,6 @@ def build_application(config: AppConfig) -> Application:
                 text="Не удалось обработать /start.",
             )
             return
-
-        if context.application.bot_data.get(HH_OUTAGE_BOT_DATA_KEY):
-            context.application.bot_data[HH_OUTAGE_BOT_DATA_KEY] = False
 
         if result.message:
             await _send_message_with_retry(
@@ -185,16 +216,19 @@ def build_application(config: AppConfig) -> Application:
 
         try:
             vacancies = await service.run_poll_cycle()
-        except HHUnavailableError:
+        except Exception as exc:
+            kind, text = _classify_runtime_error(exc)
+            if kind == "unknown":
+                LOGGER.exception("Polling cycle failed")
+            else:
+                LOGGER.warning("Polling cycle failed with kind=%s", kind, exc_info=True)
             await _notify_outage_once(
                 application,
                 context,
                 chat_id=state.chat_id,
-                text="hh.ru временно недоступен. Продолжаю попытки автоопроса.",
+                kind=kind,
+                text=text,
             )
-            return
-        except Exception:
-            LOGGER.exception("Polling cycle failed")
             return
 
         await _notify_recovery_if_needed(application, context, chat_id=state.chat_id)
@@ -212,7 +246,8 @@ def build_application(config: AppConfig) -> Application:
             raise RuntimeError("python-telegram-bot must be installed with job-queue support")
 
         application.bot_data[SERVICE_BOT_DATA_KEY] = await VacancyBotService.build(config=config)
-        application.bot_data[HH_OUTAGE_BOT_DATA_KEY] = False
+        application.bot_data[ERROR_ALERT_ACTIVE_BOT_DATA_KEY] = False
+        application.bot_data[ERROR_ALERT_KIND_BOT_DATA_KEY] = None
         application.job_queue.run_repeating(
             poll_job,
             interval=config.poll_interval_seconds,

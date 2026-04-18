@@ -6,7 +6,7 @@ from pathlib import Path
 from telegram.error import TimedOut
 
 from tg_bot_hh.config import AppConfig
-from tg_bot_hh.hh_client import HHUnavailableError
+from tg_bot_hh.hh_client import HHForbiddenError, HHUnavailableError
 from tg_bot_hh.models import StartCommandResult, StopCommandResult
 from tg_bot_hh.telegram_app import (
     _send_vacancy_batches,
@@ -253,7 +253,7 @@ def make_config() -> AppConfig:
         telegram_bot_token="token",
         hh_user_agent="agent",
         target_area_name="Пермь",
-        state_path=Path("state.json"),
+        state_path=Path("state.db"),
         poll_interval_seconds=300,
         hh_request_limit_per_cycle=60,
     )
@@ -336,7 +336,7 @@ def test_poll_job_notifies_hh_outage_once_and_reports_recovery(
     assert any("Вакансии на" in text for text in texts)
 
 
-def test_start_handler_clears_outage_flag_on_success(
+def test_start_handler_handles_hh_forbidden(
     monkeypatch,
     state_factory,
 ):
@@ -346,6 +346,7 @@ def test_start_handler_clears_outage_flag_on_success(
         config=config,
         state_store=StaticStateStore(state),
         poll_results=[()],
+        start_error=HHForbiddenError("forbidden"),
     )
     fake_builder = FakeApplicationBuilder()
 
@@ -359,7 +360,6 @@ def test_start_handler_clears_outage_flag_on_success(
 
     app = build_application(config)
     asyncio.run(app.post_init_callback(app))
-    app.bot_data["hh_outage_active"] = True
 
     start_handler = next(
         handler.callback for handler in app.handlers if "start" in handler.commands
@@ -376,4 +376,50 @@ def test_start_handler_clears_outage_flag_on_success(
     context = FakeContext(bot=FakeBot(), application=app)
     asyncio.run(start_handler(FakeUpdate(12345), context))
 
-    assert app.bot_data["hh_outage_active"] is False
+    assert any("403" in text for _, text in context.bot.messages)
+
+
+def test_poll_job_notifies_hh_forbidden_once_and_recovery(
+    monkeypatch,
+    state_factory,
+    vacancy_factory,
+):
+    config = make_config()
+    state = state_factory(chat_id=12345, polling_enabled=True)
+    vacancy = vacancy_factory(vacancy_id="vac-1", name="Python Vacancy")
+    fake_service = RuntimeServiceStub(
+        config=config,
+        state_store=StaticStateStore(state),
+        poll_results=[
+            HHForbiddenError("forbidden"),
+            HHForbiddenError("forbidden"),
+            (vacancy,),
+        ],
+    )
+    fake_builder = FakeApplicationBuilder()
+
+    class FakeVacancyBotService:
+        @classmethod
+        async def build(cls, *, config, client=None, state_store=None):
+            return fake_service
+
+    monkeypatch.setattr("tg_bot_hh.telegram_app.ApplicationBuilder", lambda: fake_builder)
+    monkeypatch.setattr("tg_bot_hh.telegram_app.VacancyBotService", FakeVacancyBotService)
+
+    app = build_application(config)
+    asyncio.run(app.post_init_callback(app))
+
+    poll_job = app.job_queue.calls[0]["callback"]
+    bot = FakeBot()
+    context = FakeContext(bot=bot, application=app)
+
+    async def run_poll_cycles():
+        await poll_job(context)
+        await poll_job(context)
+        await poll_job(context)
+
+    asyncio.run(run_poll_cycles())
+
+    texts = [text for _, text in bot.messages]
+    assert sum("403" in text for text in texts) == 1
+    assert sum("восстановлена" in text for text in texts) == 1
